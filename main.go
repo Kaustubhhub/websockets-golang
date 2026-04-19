@@ -1,85 +1,67 @@
 package main
 
 import (
-	"log"
-	"net/http"
 	"sync"
 
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+type Message struct {
+	Type   string `json:"type"`
+	RoomID string `json:"roomId"`
+	Text   string `json:"text"`
 }
 
-var mu sync.Mutex
-var rooms = make(map[string][]*websocket.Conn)
+type Client struct {
+	conn   *websocket.Conn
+	send   chan Message
+	roomID string
+}
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	roomId := r.URL.Query().Get("roomId")
+type Hub struct {
+	rooms      map[string]map[*Client]bool
+	register   chan *Client
+	unregister chan *Client
+	broadcast  chan Message
+	mu         sync.Mutex
+}
 
-	if roomId == "" {
-		http.Error(w, "Room Id required", http.StatusBadRequest)
-		return
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Upgrade error:", err)
-		return
-	}
-
-	mu.Lock()
-	rooms[roomId] = append(rooms[roomId], conn)
-	mu.Unlock()
-
-	log.Println("User connected to room:", roomId)
-
+func (h *Hub) run() {
 	for {
-		var msg map[string]string
-		err := conn.ReadJSON(&msg)
-		if err != nil {
-			log.Println("Read error:", err)
-			break
-		}
-		broadcast(roomId, msg)
-	}
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			if h.rooms[client.roomID] == nil {
+				h.rooms[client.roomID] = make(map[*Client]bool)
+			}
+			h.rooms[client.roomID][client] = true
+			h.mu.Unlock()
 
-	removeConnection(roomId, conn)
-	conn.Close()
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if clients, ok := h.rooms[client.roomID]; ok {
+				delete(clients, client)
+				close(client.send)
+			}
+			h.mu.Unlock()
 
-}
-
-func broadcast(roomId string, msg map[string]string) {
-	mu.Lock()
-	conns := rooms[roomId]
-	mu.Unlock()
-
-	for _, c := range conns {
-		err := c.WriteJSON(&msg)
-		if err != nil {
-			log.Println("Write error:", err)
-		}
-	}
-}
-
-func removeConnection(roomId string, conn *websocket.Conn) {
-	mu.Lock()
-	defer mu.Unlock()
-	conns := rooms[roomId]
-	for i, c := range conns {
-		if c == conn {
-			rooms[roomId] = append(conns[:i], conns[i+1:]...)
-			break
+		case message := <-h.broadcast:
+			h.mu.Lock()
+			if clients, ok := h.rooms[message.RoomID]; ok {
+				for client := range clients {
+					select {
+					case client.send <- message:
+					default:
+						close(client.send)
+						delete(clients, client)
+					}
+				}
+			}
+			h.mu.Unlock()
 		}
 	}
 }
 
 func main() {
-	http.HandleFunc("/ws", handleWebSocket)
 
-	log.Println("Server running on :8080")
-	http.ListenAndServe(":8080", nil)
 }
