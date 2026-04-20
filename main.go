@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -62,6 +63,74 @@ func (h *Hub) run() {
 	}
 }
 
-func main() {
+func (c *Client) readPump(h *Hub) {
+	defer func() {
+		h.unregister <- c
+		c.conn.Close()
+	}()
 
+	for {
+		var msg Message
+		err := c.conn.ReadJSON(&msg)
+		if err != nil {
+			break
+		}
+
+		msg.RoomID = c.roomID
+		h.broadcast <- msg
+	}
+}
+
+func (c *Client) writePump() {
+	defer c.conn.Close()
+
+	for msg := range c.send {
+		err := c.conn.WriteJSON(msg)
+		if err != nil {
+			break
+		}
+	}
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // allow all origins (for now)
+	},
+}
+
+func serveWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	roomID := r.URL.Query().Get("roomId")
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+
+	client := &Client{
+		conn:   conn,
+		send:   make(chan Message, 256),
+		roomID: roomID,
+	}
+
+	hub.register <- client
+
+	go client.writePump()
+	go client.readPump(hub)
+}
+
+func main() {
+	hub := &Hub{
+		rooms:      make(map[string]map[*Client]bool),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+		broadcast:  make(chan Message),
+	}
+
+	go hub.run()
+
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		serveWS(hub, w, r)
+	})
+
+	http.ListenAndServe(":8080", nil)
 }
